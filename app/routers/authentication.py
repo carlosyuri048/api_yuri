@@ -7,8 +7,8 @@ from datetime import timedelta
 from jose import JWTError, jwt
 
 from ..models.user import UserInDB
-from ..models.token import Token
-from ..core.security import verify_password, create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES, ALGORITHM
+from ..models.token import Token, AccessTokenResponse
+from ..core.security import verify_password, create_access_token, REFRESH_TOKEN_EXPIRE_MINUTES, ALGORITHM
 from ..core.config import settings
 from ..db.mongodb import database
 
@@ -16,20 +16,15 @@ router = APIRouter(
     tags=["Authentication"]
 )
 
-# Esta linha cria um "esquema" que diz ao FastAPI:
-# "Para se autenticar, espere um token na URL '/token'"
-# A documentação usará isso para criar o botão "Authorize".
+# Este esquema é usado pelo FastAPI para gerar a documentação e extrair o token do cabeçalho
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
+# Função de dependência que valida o token (access ou refresh) e retorna o usuário
 async def get_current_active_user(token: Annotated[str, Depends(oauth2_scheme)]) -> UserInDB:
     """
     Dependência para obter o usuário atual a partir de um token JWT.
-    
-    1. Decodifica o token.
-    2. Valida o token (assinatura e expiração).
-    3. Busca o usuário no banco de dados.
-    4. Retorna o objeto do usuário ou levanta uma exceção.
+    Valida a assinatura, o tempo de expiração e se o usuário existe.
     """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -51,10 +46,10 @@ async def get_current_active_user(token: Annotated[str, Depends(oauth2_scheme)])
     return UserInDB(**user_doc)
 
 
+# Função auxiliar que verifica email e senha no banco de dados
 async def authenticate_user(email: str, password: str) -> UserInDB | bool:
     """
-    Função auxiliar para autenticar um usuário.
-    Busca o usuário pelo e-mail e verifica a senha.
+    Busca o usuário pelo e-mail e verifica se a senha corresponde.
     """
     user_doc = await database["users"].find_one({"email": email})
     if not user_doc:
@@ -67,13 +62,14 @@ async def authenticate_user(email: str, password: str) -> UserInDB | bool:
     return user
 
 
+# Rota principal de login
 @router.post("/token", response_model=Token)
 async def login_for_access_token(
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()]
 ):
     """
     Endpoint de login. Recebe e-mail (no campo username) e senha.
-    Retorna um token de acesso JWT se as credenciais forem válidas.
+    Retorna um access_token (curta duração) e um refresh_token (longa duração).
     """
     user = await authenticate_user(form_data.username, form_data.password)
     if not user:
@@ -83,9 +79,32 @@ async def login_for_access_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.email}, expires_delta=access_token_expires
+    access_token = create_access_token(data={"sub": user.email})
+    
+    refresh_token_expires = timedelta(minutes=REFRESH_TOKEN_EXPIRE_MINUTES)
+    refresh_token = create_access_token(
+        data={"sub": user.email}, expires_delta=refresh_token_expires
     )
     
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {
+        "access_token": access_token, 
+        "refresh_token": refresh_token, 
+        "token_type": "bearer"
+    }
+
+
+# Rota para renovar o token de acesso
+@router.post("/token/refresh", response_model=AccessTokenResponse)
+async def refresh_access_token(
+    current_user: Annotated[UserInDB, Depends(get_current_active_user)]
+):
+    """
+    Gera um novo access token a partir de um refresh token válido.
+    Para testar na documentação, use o refresh_token no botão 'Authorize'.
+    """
+    # A dependência 'get_current_active_user' já fez todo o trabalho de validar
+    # o refresh token e nos retornar o usuário. Se chegamos até aqui, está tudo certo.
+    # Agora, apenas precisamos gerar um novo access token de curta duração.
+    new_access_token = create_access_token(data={"sub": current_user.email})
+    
+    return {"access_token": new_access_token}
